@@ -1,0 +1,269 @@
+version: "3.9"
+
+# =============================================================================
+# SI3009 | Proyecto 2 | Infraestructura Docker
+# Red simulando latencia entre nodos para PostgreSQL y CockroachDB/YugabyteDB.
+#
+# USO:
+#   docker-compose up -d
+#   docker-compose ps
+#   docker-compose down -v   # destruir todo (incluyendo datos)
+#
+# SIMULAR LATENCIA (requiere tc/netem en el host o usar Pumba):
+#   docker exec pg-nodo1 tc qdisc add dev eth0 root netem delay 5ms
+#   docker exec pg-nodo2 tc qdisc add dev eth0 root netem delay 5ms
+#   docker exec pg-nodo3 tc qdisc add dev eth0 root netem delay 5ms
+# =============================================================================
+
+networks:
+  socialnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+
+volumes:
+  pg_nodo1_data:
+  pg_nodo2_data:
+  pg_nodo3_data:
+  pg_replica1_data:
+  crdb_nodo1_data:
+  crdb_nodo2_data:
+  crdb_nodo3_data:
+
+# =============================================================================
+# PostgreSQL — 3 nodos primary + 1 réplica de ejemplo
+# =============================================================================
+services:
+
+  pg-nodo1:
+    image: postgres:15
+    container_name: pg-nodo1
+    hostname: pg-nodo1
+    environment:
+      POSTGRES_DB: socialdb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres2026
+      # Variable de shard: usada por las funciones PL/pgSQL de enrutamiento
+      POSTGRES_INITDB_ARGS: ""
+    command: >
+      postgres
+        -c wal_level=replica
+        -c max_wal_senders=5
+        -c max_replication_slots=5
+        -c wal_keep_size=256MB
+        -c synchronous_commit=on
+        -c synchronous_standby_names='replica1'
+        -c max_prepared_transactions=20
+        -c log_min_duration_statement=100
+        -c shared_preload_libraries=''
+        -c "app.shard_id=1"
+    volumes:
+      - pg_nodo1_data:/var/lib/postgresql/data
+      - ./scripts:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5431:5432"
+    networks:
+      socialnet:
+        ipv4_address: 172.20.0.11
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d socialdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  pg-nodo2:
+    image: postgres:15
+    container_name: pg-nodo2
+    hostname: pg-nodo2
+    environment:
+      POSTGRES_DB: socialdb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres2026
+    command: >
+      postgres
+        -c max_prepared_transactions=20
+        -c log_min_duration_statement=100
+        -c wal_level=replica
+        -c max_wal_senders=5
+        -c max_replication_slots=5
+        -c wal_keep_size=256MB
+        -c "app.shard_id=2"
+    volumes:
+      - pg_nodo2_data:/var/lib/postgresql/data
+      - ./scripts:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5432:5432"
+    networks:
+      socialnet:
+        ipv4_address: 172.20.0.12
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d socialdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  pg-nodo3:
+    image: postgres:15
+    container_name: pg-nodo3
+    hostname: pg-nodo3
+    environment:
+      POSTGRES_DB: socialdb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres2026
+    command: >
+      postgres
+        -c max_prepared_transactions=20
+        -c log_min_duration_statement=100
+        -c wal_level=replica
+        -c max_wal_senders=5
+        -c max_replication_slots=5
+        -c wal_keep_size=256MB
+        -c "app.shard_id=3"
+    volumes:
+      - pg_nodo3_data:/var/lib/postgresql/data
+      - ./scripts:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5433:5432"
+    networks:
+      socialnet:
+        ipv4_address: 172.20.0.13
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d socialdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Réplica de solo lectura del Nodo 1
+  # Para activar replicación real, usar pg_basebackup desde pg-nodo1
+  pg-replica1:
+    image: postgres:15
+    container_name: pg-replica1
+    hostname: pg-replica1
+    environment:
+      POSTGRES_DB: socialdb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres2026
+      PGPASSWORD: postgres2026
+    command: >
+      postgres
+        -c hot_standby=on
+        -c log_min_duration_statement=100
+    volumes:
+      - pg_replica1_data:/var/lib/postgresql/data
+    ports:
+      - "5434:5432"
+    networks:
+      socialnet:
+        ipv4_address: 172.20.0.14
+    depends_on:
+      pg-nodo1:
+        condition: service_healthy
+    # NOTA: En un entorno real, la réplica se inicializa con:
+    # pg_basebackup -h pg-nodo1 -U replicador -D /var/lib/postgresql/data -P --wal-method=stream
+
+  # =============================================================================
+  # CockroachDB — cluster de 3 nodos
+  # =============================================================================
+  crdb-nodo1:
+    image: cockroachdb/cockroach:latest-v23.2
+    container_name: crdb-nodo1
+    hostname: crdb-nodo1
+    command: >
+      start
+        --insecure
+        --store=/cockroach/cockroach-data
+        --listen-addr=crdb-nodo1:26257
+        --advertise-addr=crdb-nodo1:26257
+        --http-addr=crdb-nodo1:8080
+        --join=crdb-nodo1:26257,crdb-nodo2:26257,crdb-nodo3:26257
+        --cache=.25
+        --max-sql-memory=.25
+    volumes:
+      - crdb_nodo1_data:/cockroach/cockroach-data
+    ports:
+      - "26257:26257"
+      - "8080:8080"
+    networks:
+      socialnet:
+        ipv4_address: 172.20.0.21
+    healthcheck:
+      test: ["CMD", "cockroach", "node", "status", "--insecure", "--host=crdb-nodo1:26257"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  crdb-nodo2:
+    image: cockroachdb/cockroach:latest-v23.2
+    container_name: crdb-nodo2
+    hostname: crdb-nodo2
+    command: >
+      start
+        --insecure
+        --store=/cockroach/cockroach-data
+        --listen-addr=crdb-nodo2:26257
+        --advertise-addr=crdb-nodo2:26257
+        --http-addr=crdb-nodo2:8081
+        --join=crdb-nodo1:26257,crdb-nodo2:26257,crdb-nodo3:26257
+        --cache=.25
+        --max-sql-memory=.25
+    volumes:
+      - crdb_nodo2_data:/cockroach/cockroach-data
+    ports:
+      - "26258:26257"
+      - "8081:8081"
+    networks:
+      socialnet:
+        ipv4_address: 172.20.0.22
+
+  crdb-nodo3:
+    image: cockroachdb/cockroach:latest-v23.2
+    container_name: crdb-nodo3
+    hostname: crdb-nodo3
+    command: >
+      start
+        --insecure
+        --store=/cockroach/cockroach-data
+        --listen-addr=crdb-nodo3:26257
+        --advertise-addr=crdb-nodo3:26257
+        --http-addr=crdb-nodo3:8082
+        --join=crdb-nodo1:26257,crdb-nodo2:26257,crdb-nodo3:26257
+        --cache=.25
+        --max-sql-memory=.25
+    volumes:
+      - crdb_nodo3_data:/cockroach/cockroach-data
+    ports:
+      - "26259:26257"
+      - "8082:8082"
+    networks:
+      socialnet:
+        ipv4_address: 172.20.0.23
+
+  # Inicializador del cluster CockroachDB (se ejecuta una sola vez)
+  crdb-init:
+    image: cockroachdb/cockroach:latest-v23.2
+    container_name: crdb-init
+    command: >
+      init --insecure --host=crdb-nodo1:26257
+    networks:
+      - socialnet
+    depends_on:
+      crdb-nodo1:
+        condition: service_healthy
+    restart: "no"
+
+  # =============================================================================
+  # Pumba — simulación de fallos y latencia de red
+  # USO:
+  #   docker-compose run pumba netem --duration 60s delay --time 50 pg-nodo2
+  #   docker-compose run pumba kill --signal SIGKILL crdb-nodo2
+  # =============================================================================
+  pumba:
+    image: gaiaadm/pumba:latest
+    container_name: pumba
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - socialnet
+    profiles:
+      - chaos   # Solo se inicia con: docker-compose --profile chaos up pumba
