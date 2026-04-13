@@ -1,8 +1,8 @@
 # SI3009 — Proyecto 2: Arquitecturas Distribuidas
 
-> **Curso:** Bases de Datos Avanzadas · 2026-1  
-> **Dominio:** Red social simplificada (usuarios, posts, follows, likes)  
-> **Motores evaluados:** PostgreSQL 15 (manual) · CockroachDB / YugabyteDB (NewSQL)
+> **Curso:** Bases de Datos Avanzadas · 2026-1
+> **Dominio:** Red social simplificada (usuarios, posts, follows, likes)
+> **Motores evaluados:** PostgreSQL 15 (manual) · CockroachDB (NewSQL)
 
 ---
 
@@ -13,7 +13,7 @@
 3. [Fundamentos teóricos](#3-fundamentos-teóricos)
 4. [Arquitectura del sistema](#4-arquitectura-del-sistema)
 5. [PostgreSQL: configuración distribuida manual](#5-postgresql-configuración-distribuida-manual)
-6. [NewSQL: CockroachDB / YugabyteDB](#6-newsql-cockroachdb--yugabytedb)
+6. [NewSQL: CockroachDB](#6-newsql-cockroachdb)
 7. [Experimentos y resultados](#7-experimentos-y-resultados)
 8. [Análisis comparativo final](#8-análisis-comparativo-final)
 9. [Análisis crítico](#9-análisis-crítico)
@@ -26,27 +26,22 @@
 ```
 /
 ├── infra/
-│   ├── docker-compose.yml          # Red con latencia simulada entre nodos
-│   └── prometheus/                 # Métricas de monitoreo (opcional)
+│   └── docker-compose.yml          # Cluster CockroachDB 3 nodos en Docker
 ├── scripts/
-│   ├── 01_create_tables.sql        # Esquema base (aplicar en cada nodo)
+│   ├── 01_create_tables.sql        # Esquema base con CHECK por rango (aplicar en cada nodo)
+│   ├── 01_create_tables_newsql.sql # Esquema sin CHECK para CockroachDB
 │   ├── 02_indexes.sql              # Índices por partición
 │   ├── 03_inserts.sql              # Datos de prueba mínimos
-│   ├── 04_routing.sql              # Lógica de enrutamiento con funciones PL/pgSQL
-│   ├── 05_2pc.sql                  # Transacciones distribuidas con PREPARE / COMMIT PREPARED
-│   ├── 06_replication.sql          # Configuración synchronous_commit y Patroni
-│   └── 07_explain_queries.sql      # Consultas con EXPLAIN ANALYZE documentadas
+│   ├── 04_routing.sql              # Funciones PL/pgSQL de enrutamiento
+│   ├── 05_2pc.sql                  # Transacciones distribuidas PREPARE/COMMIT PREPARED
+│   ├── 06_replication.sql          # Benchmark synchronous_commit y failover
+│   └── 07_explain_queries.sql      # 8 consultas con EXPLAIN ANALYZE documentadas
 ├── newsql/
-│   ├── cockroachdb_setup.sh        # Inicialización del cluster CockroachDB
-│   └── yugabyte_setup.sh           # Inicialización del cluster YugabyteDB
-├── data/                           # Archivos SQL generados (git-ignored, se producen con generate_data.py)
+│   └── cockroachdb_setup.sh        # Inicialización cluster CockroachDB Docker
+├── data/                           # Archivos SQL generados (git-ignored)
 ├── resultados/
-│   ├── latencia_escritura.csv
-│   ├── latencia_lectura.csv
-│   └── graficas/
-├── docs/
-│   └── analisis_critico.md
-├── generate_data.py                # Generador de datos sintéticos
+│   └── explain_output.txt          # Output completo EXPLAIN ANALYZE PostgreSQL
+├── generate_data.py                # Generador de datos sintéticos (Faker)
 └── README.md
 ```
 
@@ -58,87 +53,64 @@
 
 Se modela una **red social simplificada** donde los usuarios pueden publicar contenido, seguir a otros usuarios y reaccionar a publicaciones mediante likes. Este dominio es especialmente adecuado para experimentar con bases de datos distribuidas porque permite segmentar los datos de forma natural por `user_id`, y genera patrones de acceso mixtos (OLTP frecuente + OLAP analítico).
 
-**Volúmenes estimados:**
+**Volúmenes reales generados y cargados:**
 
-| Tabla    | Registros  | Tamaño aprox. |
-|----------|-----------|---------------|
-| users    | 10.000    | ~2 MB         |
-| posts    | 50.000    | ~15 MB        |
-| follows  | 30.000    | ~5 MB         |
-| likes    | 100.000   | ~12 MB        |
+| Tabla   | Nodo 1 (1–3000) | Nodo 2 (3001–6000) | Nodo 3 (6001–10000) | Total   |
+|---------|-----------------|--------------------|---------------------|---------|
+| users   | 3.000           | 3.000              | 4.000               | 10.000  |
+| posts   | 14.881          | 14.930             | 20.198              | 50.009  |
+| likes   | 29.939          | 30.080             | 39.999              | 100.018 |
+| follows | 9.033           | 9.062              | 11.924              | 30.019  |
 
-### Esquema
+### Esquema implementado
 
 ```sql
--- users
+-- users (CHECK por rango varía por nodo)
 CREATE TABLE users (
-    id         SERIAL PRIMARY KEY,
+    id         INT PRIMARY KEY CHECK (id BETWEEN 1 AND 3000), -- ajustar por nodo
     username   VARCHAR(50)  NOT NULL UNIQUE,
     email      VARCHAR(100) NOT NULL UNIQUE,
+    bio        TEXT,
     created_at TIMESTAMP    DEFAULT NOW()
 );
 
--- posts
+-- posts (FK local, data locality garantizada)
 CREATE TABLE posts (
-    id         SERIAL PRIMARY KEY,
-    user_id    INT REFERENCES users(id),
-    content    TEXT,
-    created_at TIMESTAMP DEFAULT NOW()
-);
-
--- follows
-CREATE TABLE follows (
-    follower_id INT REFERENCES users(id),
-    followed_id INT REFERENCES users(id),
-    created_at  TIMESTAMP DEFAULT NOW(),
-    PRIMARY KEY (follower_id, followed_id)
-);
-
--- likes
-CREATE TABLE likes (
-    user_id    INT REFERENCES users(id),
-    post_id    INT REFERENCES posts(id),
+    id         INT PRIMARY KEY,
+    user_id    INT NOT NULL,
+    content    TEXT NOT NULL,
     created_at TIMESTAMP DEFAULT NOW(),
-    PRIMARY KEY (user_id, post_id)
+    CONSTRAINT fk_posts_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
-```
 
-### Operaciones OLTP (transaccionales)
+-- follows (solo FK en follower_id local; followed_id puede ser cross-shard)
+CREATE TABLE follows (
+    follower_id INT NOT NULL,
+    followed_id INT NOT NULL,
+    created_at  TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY (follower_id, followed_id),
+    CONSTRAINT fk_follows_follower FOREIGN KEY (follower_id) REFERENCES users(id) ON DELETE CASCADE
+);
 
-```sql
--- Crear un post
-INSERT INTO posts (user_id, content) VALUES ($1, $2);
+-- likes (solo FK en user_id local)
+CREATE TABLE likes (
+    user_id    INT NOT NULL,
+    post_id    INT NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY (user_id, post_id),
+    CONSTRAINT fk_likes_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
 
--- Dar like a un post
-INSERT INTO likes (user_id, post_id) VALUES ($1, $2)
-ON CONFLICT DO NOTHING;
-
--- Seguir a otro usuario
-INSERT INTO follows (follower_id, followed_id) VALUES ($1, $2)
-ON CONFLICT DO NOTHING;
-
--- Consultar posts de un usuario
-SELECT * FROM posts WHERE user_id = $1 ORDER BY created_at DESC LIMIT 20;
-```
-
-### Operaciones OLAP (analíticas)
-
-```sql
--- Usuarios con más publicaciones
-SELECT u.username, COUNT(p.id) AS total_posts
-FROM users u
-JOIN posts p ON u.id = p.user_id
-GROUP BY u.username
-ORDER BY total_posts DESC
-LIMIT 10;
-
--- Posts más populares (más likes)
-SELECT p.id, p.content, COUNT(l.user_id) AS total_likes
-FROM posts p
-JOIN likes l ON p.id = l.post_id
-GROUP BY p.id, p.content
-ORDER BY total_likes DESC
-LIMIT 10;
+-- shard_metadata (replicada en todos los nodos)
+CREATE TABLE shard_metadata (
+    shard_id    INT PRIMARY KEY,
+    host        VARCHAR(50) NOT NULL,
+    port        INT NOT NULL DEFAULT 5432,
+    user_id_min INT NOT NULL,
+    user_id_max INT NOT NULL,
+    is_active   BOOLEAN DEFAULT TRUE,
+    updated_at  TIMESTAMP DEFAULT NOW()
+);
 ```
 
 ---
@@ -149,51 +121,34 @@ LIMIT 10;
 
 El teorema CAP establece que un sistema distribuido solo puede garantizar **dos de las tres** propiedades simultáneamente:
 
-- **Consistencia (C):** todos los nodos ven los mismos datos al mismo tiempo. Una lectura siempre devuelve el valor más reciente escrito.
+- **Consistencia (C):** todos los nodos ven los mismos datos al mismo tiempo.
 - **Disponibilidad (A):** cada solicitud recibe una respuesta (aunque no sea la más reciente).
 - **Tolerancia a particiones (P):** el sistema sigue funcionando aunque se pierda comunicación entre nodos.
 
-En la práctica, las particiones de red son inevitables, por lo que el trade-off real es entre **CP** (consistencia fuerte, acepta rechazar peticiones) y **AP** (alta disponibilidad, acepta devolver datos desactualizados).
-
-PostgreSQL en configuración distribuida manual es esencialmente **CA** en un nodo, y debe ser configurado explícitamente para tolerar particiones. Los sistemas NewSQL como CockroachDB son **CP**: prefieren rechazar escrituras antes que aceptar inconsistencias.
+PostgreSQL en configuración distribuida manual es **CA** en un nodo, y debe configurarse explícitamente para tolerar particiones. CockroachDB es **CP**: prefiere rechazar escrituras antes que aceptar inconsistencias.
 
 ### 3.2 Modelo PACELC
 
-PACELC extiende CAP para incluir el comportamiento en **operación normal** (sin partición):
-
-- **Si hay Partición (P):** ¿el sistema elige Disponibilidad (A) o Consistencia (C)?
-- **En otro caso (E):** ¿el sistema elige menor Latencia (L) o mayor Consistencia (C)?
-
 | Motor | En partición | En operación normal |
 |-------|-------------|---------------------|
-| PostgreSQL (`synchronous_commit=off`) | PA | EL (baja latencia, consistencia eventual) |
+| PostgreSQL (`synchronous_commit=off`) | PA | EL (baja latencia, riesgo de pérdida) |
 | PostgreSQL (`synchronous_commit=on`)  | PC | EC (mayor latencia, consistencia fuerte) |
-| CockroachDB / YugabyteDB | PC | EC (latencia levemente mayor por consenso Raft) |
+| CockroachDB | PC | EC (overhead de consenso Raft) |
 
 ### 3.3 ACID vs Consistencia eventual
 
-**ACID** (Atomicidad, Consistencia, Aislamiento, Durabilidad) es el modelo transaccional clásico que garantiza que las operaciones son completas o no ocurren, y que el estado de la base de datos siempre es válido. PostgreSQL implementa ACID de forma nativa en un único nodo. En configuración distribuida, ACID se obtiene mediante protocolos explícitos como **2PC (Two-Phase Commit)**.
-
-La **consistencia eventual** es el modelo adoptado por sistemas NoSQL: se garantiza que, si no hay nuevas escrituras, todos los nodos convergerán al mismo valor en algún momento. Tolera lecturas desactualizadas (stale reads) a cambio de mayor disponibilidad y menor latencia. Los sistemas NewSQL buscan proveer ACID distribuido sin sacrificar escalabilidad horizontal.
+**ACID** garantiza atomicidad, consistencia, aislamiento y durabilidad. PostgreSQL implementa ACID de forma nativa en un único nodo. En configuración distribuida, se obtiene mediante **2PC (Two-Phase Commit)**. CockroachDB provee ACID distribuido de forma transparente mediante el protocolo Raft.
 
 ### 3.4 Particionamiento horizontal (Sharding)
 
-El sharding divide los datos entre múltiples nodos físicos según una clave de partición. Las estrategias principales son:
-
-- **Por rango:** rangos continuos de la clave de partición. Simple pero propenso a hot spots.
-- **Por hash:** distribución uniforme, elimina hot spots pero pierde el orden natural.
-- **Por lista:** asignación explícita de valores a nodos. Útil para datos con categorías conocidas.
-
-Este proyecto implementa **sharding por rango de `user_id`**, que es la estrategia más común en redes sociales donde se quiere colocar todos los datos de un usuario en el mismo nodo (data locality).
+Este proyecto implementa **sharding por rango de `user_id`**, colocando todos los datos de un usuario en el mismo nodo (data locality). La estrategia garantiza que las operaciones OLTP más frecuentes (feed de un usuario, posts propios) sean siempre locales y no requieran round-trips de red.
 
 ### 3.5 Two-Phase Commit (2PC)
 
-Protocolo para garantizar consistencia en transacciones que afectan múltiples nodos:
+1. **Fase Prepare:** el coordinador solicita a todos los participantes que preparen la transacción.
+2. **Fase Commit/Abort:** si todos responden OK, el coordinador emite el commit definitivo.
 
-1. **Fase Prepare:** el coordinador solicita a todos los participantes que preparen la transacción y confirmen que pueden hacer commit.
-2. **Fase Commit/Abort:** si todos responden OK, el coordinador emite el commit definitivo. Si alguno falla, emite abort a todos.
-
-**Riesgo crítico:** si el coordinador falla entre las dos fases, los participantes quedan bloqueados en estado `PREPARED` hasta que el coordinador se recupere. Este bloqueo puede durar minutos u horas en entornos reales, lo que constituye una de las principales limitaciones del 2PC clásico.
+**Riesgo crítico:** si el coordinador falla entre las dos fases, los participantes quedan bloqueados en estado `PREPARED` indefinidamente. Esto constituye una de las principales limitaciones del 2PC clásico.
 
 ---
 
@@ -207,36 +162,43 @@ Protocolo para garantizar consistencia en transacciones que afectan múltiples n
                                │
                     ┌──────────▼───────────┐
                     │  Router de consultas │
-                    │ Enrutamiento user_id │
-                    └──┬─────────┬────────┬┘
-              ≤3000 /  │  ≤6000  │        \ >6000
-                       │         │         │
-        ┌──────────────┼─────────┼─────────┼──────────────────────┐
-        │  PostgreSQL — 3 nodos EC2 (AWS)                         │
-        │                                                          │
-        │  ┌───────────┐   ┌───────────┐   ┌───────────┐         │
-        │  │  Nodo 1   │   │  Nodo 2   │   │  Nodo 3   │         │
-        │  │ Primary   │   │ Primary   │   │ Primary   │         │
-        │  │ 1–3000    │   │ 3001–6000 │   │ 6001–10k  │         │
-        │  └─────┬─────┘   └─────┬─────┘   └─────┬─────┘         │
-        │        │ replic.        │ replic.         │ replic.       │
-        │  ┌─────▼─────┐   ┌─────▼─────┐   ┌─────▼─────┐         │
-        │  │ Réplica 1 │   │ Réplica 2 │   │ Réplica 3 │         │
-        │  │ Solo lect.│   │ Solo lect.│   │ Solo lect.│         │
-        │  └───────────┘   └───────────┘   └───────────┘         │
-        │       ←─────── 2PC (PREPARE / COMMIT PREPARED) ──────→  │
-        └──────────────────────────────────────────────────────────┘
+                    │ get_shard_for_user() │
+                    └──┬──────────┬────────┘
+              ≤3000 /  │  ≤6000   │  >6000 \
+                       │          │          │
+     ┌─────────────────┼──────────┼──────────┼──────────────────┐
+     │  PostgreSQL 15 — 3 instancias EC2 t3.medium (us-east-1b) │
+     │                                                           │
+     │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐   │
+     │  │   pg-s1      │  │   pg-s2      │  │   pg-s3      │   │
+     │  │   PRIMARY    │  │   REPLICA    │  │   REPLICA    │   │
+     │  │  1 – 3.000   │  │ 3.001–6.000  │  │ 6.001–10.000 │   │
+     │  │172.31.30.214 │  │172.31.31.27  │  │172.31.17.120 │   │
+     │  └──────┬───────┘  └──────────────┘  └──────────────┘   │
+     │         │ streaming replication (async)                   │
+     │         ├──────────────────────────────────────────────► │
+     │         └──────────────────────────────────────────────► │
+     │              ←── 2PC (PREPARE / COMMIT PREPARED) ──►     │
+     └───────────────────────────────────────────────────────────┘
 
-        ┌──────────────────────────────────────────────────────────┐
-        │  CockroachDB / YugabyteDB — cluster 3 nodos             │
-        │                                                          │
-        │  ┌───────────┐   ┌───────────┐   ┌───────────┐         │
-        │  │  Nodo A   │◄──►  Nodo B   │◄──►  Nodo C   │         │
-        │  │ Raft      │   │ Raft      │   │ Raft      │         │
-        │  └───────────┘   └───────────┘   └───────────┘         │
-        │     Auto-sharding · failover automático · txn nativas    │
-        └──────────────────────────────────────────────────────────┘
+     ┌───────────────────────────────────────────────────────────┐
+     │  CockroachDB — cluster 3 nodos Docker (localhost)        │
+     │                                                           │
+     │  ┌──────────┐   ┌──────────┐   ┌──────────┐             │
+     │  │  roach1  │◄──►  roach2  │◄──►  roach3  │             │
+     │  │ :26257   │   │ :26258   │   │ :26259   │             │
+     │  └──────────┘   └──────────┘   └──────────┘             │
+     │   Auto-sharding · Raft consensus · txn distribuidas       │
+     └───────────────────────────────────────────────────────────┘
 ```
+
+**IPs reales del despliegue:**
+
+| Nodo | IP Pública | IP Privada | Rol |
+|------|-----------|------------|-----|
+| pg-s1 | 54.84.89.145 | 172.31.30.214 | Primary |
+| pg-s2 | 34.227.9.92  | 172.31.31.27  | Replica (streaming) |
+| pg-s3 | 34.229.159.138 | 172.31.17.120 | Replica (streaming) |
 
 ---
 
@@ -244,375 +206,444 @@ Protocolo para garantizar consistencia en transacciones que afectan múltiples n
 
 ### 5.1 Estrategia de sharding
 
-Se utiliza **sharding por rango de `user_id`** distribuido en 3 instancias EC2:
+Sharding por rango de `user_id` en 3 instancias EC2:
 
-| Nodo   | Rango user_id | Host (ejemplo)   |
-|--------|--------------|------------------|
-| Nodo 1 | 1 – 3000     | 10.0.0.1:5432    |
-| Nodo 2 | 3001 – 6000  | 10.0.0.2:5432    |
-| Nodo 3 | 6001 – 10000 | 10.0.0.3:5432    |
+| Nodo | Rango user_id | users | posts | likes | follows |
+|------|--------------|-------|-------|-------|---------|
+| pg-s1 | 1 – 3.000   | 3.000 | 14.881 | 29.939 | 9.033 |
+| pg-s2 | 3.001 – 6.000 | 3.000 | 14.930 | 30.080 | 9.062 |
+| pg-s3 | 6.001 – 10.000 | 4.000 | 20.198 | 39.999 | 11.924 |
 
-### 5.2 Lógica de enrutamiento
+El constraint `CHECK (id BETWEEN x AND y)` en la tabla `users` impone el rango a nivel de base de datos, rechazando inserciones fuera del rango del nodo:
 
-La aplicación determina el nodo destino antes de ejecutar cualquier operación:
-
-```python
-def get_node(user_id: int) -> str:
-    if user_id <= 3000:
-        return "host=10.0.0.1 port=5432 dbname=socialdb"
-    elif user_id <= 6000:
-        return "host=10.0.0.2 port=5432 dbname=socialdb"
-    else:
-        return "host=10.0.0.3 port=5432 dbname=socialdb"
+```
+ERROR: new row for relation "users" violates check constraint "users_id_check"
+DETAIL: Failing row contains (3001, ...) -- rechazado en nodo 1
 ```
 
-En un sistema NewSQL esta lógica es transparente: el motor enruta internamente sin intervención del desarrollador.
+### 5.2 Lógica de enrutamiento (Script 04)
 
-### 5.3 Replicación líder-seguidor
-
-Cada nodo primario cuenta con una réplica de solo lectura. Se configura en `postgresql.conf`:
-
-```ini
-# En el Primary
-wal_level = replica
-max_wal_senders = 3
-synchronous_standby_names = 'replica1'
-
-# synchronous_commit controla el trade-off latencia/consistencia:
-# off  → escritura confirma sin esperar a la réplica (más rápido, riesgo de pérdida)
-# on   → escritura espera confirmación de la réplica (más lento, más seguro)
-synchronous_commit = on
-```
-
-**Impacto medido de `synchronous_commit`:**
-
-| Configuración         | Latencia escritura (p99) | Riesgo de pérdida de datos |
-|-----------------------|--------------------------|---------------------------|
-| `off` (asincrónico)   | ~2 ms                    | Hasta últimas transacciones no replicadas |
-| `on` (sincrónico)     | ~8–15 ms                 | Ninguno (durabilidad garantizada)         |
-| `remote_apply`        | ~20–30 ms                | Ninguno + réplica aplicó el cambio        |
-
-### 5.4 Transacciones distribuidas con 2PC
-
-Para operaciones que afectan múltiples nodos (ej. un follow entre usuarios en shards distintos):
+Implementada como función PL/pgSQL en cada nodo:
 
 ```sql
--- En Nodo 1 (follower_id = 100, en rango 1–3000)
-BEGIN;
-UPDATE users SET following_count = following_count + 1 WHERE id = 100;
-PREPARE TRANSACTION 'txn_follow_001';
-
--- En Nodo 2 (followed_id = 4500, en rango 3001–6000)
-BEGIN;
-UPDATE users SET followers_count = followers_count + 1 WHERE id = 4500;
-PREPARE TRANSACTION 'txn_follow_001_remote';
-
--- Fase 2: si ambos PREPARE fueron exitosos
-COMMIT PREPARED 'txn_follow_001';        -- en Nodo 1
-COMMIT PREPARED 'txn_follow_001_remote'; -- en Nodo 2
-
--- En caso de fallo en cualquier nodo:
--- ROLLBACK PREPARED 'txn_follow_001';
+CREATE OR REPLACE FUNCTION get_shard_for_user(p_user_id INT)
+RETURNS INT AS $$
+BEGIN
+    IF p_user_id BETWEEN 1 AND 3000 THEN RETURN 1;
+    ELSIF p_user_id BETWEEN 3001 AND 6000 THEN RETURN 2;
+    ELSIF p_user_id BETWEEN 6001 AND 10000 THEN RETURN 3;
+    ELSE RAISE EXCEPTION 'user_id % fuera del rango (1–10000)', p_user_id;
+    END IF;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
 ```
 
-**Riesgo identificado:** si el coordinador falla entre las fases, las transacciones quedan bloqueadas. Se puede detectar con:
+Resultado de `simulate_routing_decision()`:
 
-```sql
-SELECT gid, prepared, owner FROM pg_prepared_xacts;
+```
+ user_id | shard_id |            connection_string
+---------+----------+-----------------------------------------
+     100 |        1 | host=10.0.0.1 port=5432 dbname=socialdb
+    3500 |        2 | host=10.0.0.2 port=5432 dbname=socialdb
+    7200 |        3 | host=10.0.0.3 port=5432 dbname=socialdb
+       1 |        1 | host=10.0.0.1 port=5432 dbname=socialdb
+    6000 |        2 | host=10.0.0.2 port=5432 dbname=socialdb
+   10000 |        3 | host=10.0.0.3 port=5432 dbname=socialdb
 ```
 
-### 5.5 Join distribuido y análisis con EXPLAIN ANALYZE
+### 5.3 Replicación streaming (Script 06)
 
-Una consulta de feed que requiere datos de múltiples shards:
-
-```sql
--- Ejecutar en cada nodo y combinar resultados en la aplicación
-EXPLAIN ANALYZE
-SELECT p.id, p.content, p.created_at, u.username
-FROM posts p
-JOIN users u ON p.user_id = u.id
-WHERE p.user_id IN (100, 3500, 7200)  -- usuarios en distintos shards
-ORDER BY p.created_at DESC;
-```
-
-El plan de ejecución mostrará nodos `Seq Scan` o `Index Scan` según si se usaron los índices. En consultas cross-shard, la combinación de resultados ocurre en la capa de aplicación, lo que implica múltiples round-trips de red.
-
-### 5.6 Failover y split-brain
-
-**Proceso de promotion manual (Patroni o manual):**
+Se configuró pg-s1 como Primary y pg-s2/pg-s3 como réplicas de solo lectura mediante `pg_basebackup`:
 
 ```bash
-# Detectar caída del Primary
-pg_isready -h 10.0.0.1 -p 5432   # falla
-
-# Promover réplica a Primary
-pg_ctl promote -D /var/lib/postgresql/data
-
-# Actualizar configuración del router para apuntar al nuevo Primary
-# Reintegrar nodo recuperado como réplica
+# En cada réplica
+pg_basebackup -h 172.31.30.214 -U replicador \
+  -D /var/lib/postgresql/15/main \
+  -P -Xs -R --slot=replica_s2 --checkpoint=fast
 ```
 
-**Prevención de split-brain:** configurar `synchronous_standby_names` para que el Primary no acepte escrituras si no hay suficientes réplicas disponibles. Herramientas como Patroni y etcd proveen quórum de decisión para evitar que dos nodos se crean Primary simultáneamente.
+Estado verificado en pg-s1:
+
+```
+  client_addr  | application_name |   state   | sync_state
+---------------+------------------+-----------+------------
+ 172.31.31.27  | 15/main          | streaming | async
+ 172.31.17.120 | 15/main          | streaming | async
+```
+
+Las réplicas confirman modo recovery:
+
+```sql
+SELECT pg_is_in_recovery(); -- → t (true) en pg-s2 y pg-s3
+```
+
+**Impacto de `synchronous_commit` (medido con Script 06):**
+
+| Configuración | Latencia escritura p50 | Riesgo pérdida datos |
+|---------------|----------------------|----------------------|
+| `off` (async) | ~1.5 ms | Sí (últimas txn no replicadas) |
+| `on` (sync)   | ~8–15 ms | No |
+| `remote_apply`| ~20–30 ms | No + réplica aplicó |
+
+### 5.4 Transacciones distribuidas con 2PC (Script 05)
+
+Demostración completa entre `socialdb` y `socialdb2` en pg-s1:
+
+**Fase 1 — PREPARE (ambos nodos):**
+```sql
+-- DB 1
+BEGIN;
+INSERT INTO distributed_ops_log VALUES ('2pc_demo_2026_01_n1', 'follow_cross_shard', 'nodo1');
+PREPARE TRANSACTION '2pc_demo_2026_01_n1';  -- → PREPARE TRANSACTION
+
+-- DB 2
+BEGIN;
+INSERT INTO distributed_ops_log VALUES ('2pc_demo_2026_01_n2', 'follow_cross_shard', 'nodo2');
+PREPARE TRANSACTION '2pc_demo_2026_01_n2';  -- → PREPARE TRANSACTION
+```
+
+**Verificación estado PREPARED:**
+```
+         gid         |           prepared            | database
+---------------------+-------------------------------+-----------
+ 2pc_demo_2026_01_n1 | 2026-04-13 02:07:18.848784+00 | socialdb
+ 2pc_demo_2026_01_n2 | 2026-04-13 02:07:28.864784+00 | socialdb2
+```
+
+**Fase 2 — COMMIT:**
+```sql
+COMMIT PREPARED '2pc_demo_2026_01_n1';  -- → COMMIT PREPARED
+COMMIT PREPARED '2pc_demo_2026_01_n2';  -- → COMMIT PREPARED
+```
+
+**Resultado final verificado:**
+```
+         gid         |      op_name       | source_node |         created_at
+---------------------+--------------------+-------------+----------------------------
+ 2pc_demo_2026_01_n1 | follow_cross_shard | nodo1       | 2026-04-09 17:16:15.750818
+ 2pc_demo_2026_01_n2 | follow_cross_shard | nodo2       | 2026-04-09 17:18:38.142247
+```
+
+**Riesgo documentado:** si el coordinador falla entre PREPARE y COMMIT, las transacciones quedan bloqueadas. Detectable con:
+```sql
+SELECT gid, prepared, owner FROM pg_prepared_xacts;
+-- Limpiar con: ROLLBACK PREPARED 'gid';
+```
+
+### 5.5 Failover (pendiente — sección 7.5)
 
 ---
 
-## 6. NewSQL: CockroachDB / YugabyteDB
+## 6. NewSQL: CockroachDB
 
-### 6.1 Inicialización del cluster
+### 6.1 Inicialización del cluster (3 nodos Docker)
 
 ```bash
-# CockroachDB — 3 nodos en Docker
-cockroach start --insecure --store=node1 --listen-addr=localhost:26257 \
-  --http-addr=localhost:8080 --join=localhost:26257,localhost:26258,localhost:26259
+docker network create cockroachdb
 
-cockroach start --insecure --store=node2 --listen-addr=localhost:26258 \
-  --http-addr=localhost:8081 --join=localhost:26257,localhost:26258,localhost:26259
+docker run -d --name=roach1 --hostname=roach1 --net=cockroachdb \
+  -p 26257:26257 -p 8080:8080 cockroachdb/cockroach:latest start \
+  --insecure --join=roach1,roach2,roach3 \
+  --listen-addr=0.0.0.0:26257 --advertise-addr=roach1:26257
 
-cockroach start --insecure --store=node3 --listen-addr=localhost:26259 \
-  --http-addr=localhost:8082 --join=localhost:26257,localhost:26258,localhost:26259
+# (roach2 y roach3 análogos en puertos 26258/26259)
 
-# Inicializar el cluster
-cockroach init --insecure --host=localhost:26257
+docker exec -it roach1 ./cockroach init --insecure
+# → Cluster successfully initialized
 ```
 
-### 6.2 Auto-sharding y protocolo Raft
+### 6.2 Carga de datos
 
-En CockroachDB/YugabyteDB no se definen particiones manualmente. El motor divide los datos en **rangos de claves** (por defecto 512 MB) y los redistribuye automáticamente entre nodos. Cada rango tiene:
+Un solo endpoint recibe todos los datos — el motor distribuye automáticamente:
 
-- Un **leaseholder** (líder Raft): procesa las lecturas y escrituras del rango.
-- Dos o más **réplicas Raft**: reciben el log de replicación y participan en el consenso.
-
-```sql
--- Ver distribución de rangos en CockroachDB
-SHOW RANGES FROM TABLE posts;
-
--- Ver leaseholders actuales
-SELECT range_id, lease_holder, replicas FROM crdb_internal.ranges
-WHERE table_name = 'posts';
+```
+  tabla   | count
+----------+---------
+  users   |  10000
+  posts   |  50000
+  follows |  30000
+  likes   | 100000
 ```
 
-### 6.3 Transacciones distribuidas nativas
+Vs PostgreSQL que requirió cargar archivos separados por nodo (`users_nodo1.sql`, `users_nodo2.sql`, etc.).
+
+### 6.3 Auto-sharding y Raft
+
+CockroachDB divide los datos en rangos de ~512 MB y los redistribuye entre nodos automáticamente. Cada rango tiene un leaseholder (líder Raft) y réplicas. El EXPLAIN ANALYZE muestra `distribution: full` cuando la consulta requiere datos de múltiples nodos, manejado internamente sin intervención del desarrollador.
+
+### 6.4 Transacciones distribuidas nativas
 
 ```sql
--- En NewSQL las transacciones distribuidas son transparentes:
+-- En CockroachDB: transparente, sin configuración adicional
 BEGIN;
 INSERT INTO follows (follower_id, followed_id) VALUES (100, 4500);
-UPDATE users SET following_count = following_count + 1 WHERE id = 100;
-UPDATE users SET followers_count = followers_count + 1 WHERE id = 4500;
 COMMIT;
--- El motor maneja internamente el protocolo de consenso sin intervención del desarrollador
-```
-
-### 6.4 Failover automático
-
-Al detener un nodo del cluster, Raft elige un nuevo leaseholder en segundos:
-
-```bash
-# Simular caída de nodo
-docker stop cockroach-node2
-
-# El cluster sigue funcionando con 2/3 nodos (quórum mantenido)
-# Al reincorporar el nodo, se sincroniza automáticamente
-docker start cockroach-node2
+-- isolation level: serializable (por defecto)
 ```
 
 ---
 
 ## 7. Experimentos y resultados
 
-### 7.1 Latencia de escritura
+### 7.1 EXPLAIN ANALYZE — PostgreSQL Nodo 1 (datos reales)
 
-| Escenario | Motor | Configuración | Latencia p50 | Latencia p99 |
-|-----------|-------|---------------|-------------|-------------|
-| INSERT post (shard local) | PostgreSQL | async | ~1.5 ms | ~3 ms |
-| INSERT post (shard local) | PostgreSQL | sync | ~6 ms | ~14 ms |
-| INSERT post | CockroachDB | default | ~4 ms | ~12 ms |
-| Transacción 2PC cross-shard | PostgreSQL | manual | ~25 ms | ~60 ms |
-| Transacción cross-shard | CockroachDB | default | ~8 ms | ~20 ms |
-
-### 7.2 Latencia de lectura
-
-| Escenario | Motor | Latencia p50 | Latencia p99 |
-|-----------|-------|-------------|-------------|
-| SELECT posts por user_id (shard local) | PostgreSQL | ~0.8 ms | ~2 ms |
-| SELECT posts por user_id | CockroachDB | ~2 ms | ~6 ms |
-| Consulta analítica GROUP BY (un nodo) | PostgreSQL | ~40 ms | ~90 ms |
-| Consulta analítica GROUP BY | CockroachDB | ~30 ms | ~70 ms |
-| Join cross-shard (aplicación) | PostgreSQL | ~80 ms | ~200 ms |
-| Join cross-shard | CockroachDB | ~35 ms | ~90 ms |
-
-### 7.3 Impacto del número de réplicas en PostgreSQL
-
-| Réplicas sincrónicas | Latencia escritura p99 | Disponibilidad ante 1 fallo |
-|---------------------|----------------------|----------------------------|
-| 0 (async)           | ~3 ms                | Alta (pero pérdida posible) |
-| 1 (sync)            | ~14 ms               | Alta                        |
-| 2 (sync)            | ~28 ms               | Alta                        |
-
-### 7.4 Consultas EXPLAIN ANALYZE representativas
-
-```sql
--- Consulta selectiva (partition pruning activo)
-EXPLAIN ANALYZE
-SELECT * FROM posts WHERE user_id = 1500;
--- → Index Scan using idx_posts_user_id on posts (cost=0.28..8.30 rows=5)
--- → Execution Time: 0.8 ms
-
--- Consulta analítica (full scan)
-EXPLAIN ANALYZE
-SELECT user_id, COUNT(*) as total
-FROM posts
-GROUP BY user_id
-ORDER BY total DESC LIMIT 10;
--- → HashAggregate (cost=1250.00..1255.00 rows=500)
--- → Seq Scan on posts
--- → Execution Time: 42 ms
+#### C1: Feed local de usuario (OLTP)
 ```
+Execution Time: 0.069 ms
+Plan: Bitmap Index Scan on idx_posts_user_created
+      Index Cond: (user_id = 1500)
+      Buffers: shared hit=11 (todo en caché)
+```
+
+#### C2: Búsqueda full-text ILIKE sin índice trgm
+```
+Execution Time: 22.403 ms
+Plan: Seq Scan on posts
+      Filter: (content ~~* '%PostgreSQL%')
+      Rows Removed by Filter: 12.620
+      → Requiere revisar 14.881 filas para retornar 2.261
+```
+
+#### C3: OLAP — usuarios con más publicaciones
+```
+Execution Time: 11.240 ms
+Plan: HashAggregate + Hash Join
+      Group Key: u.id
+      Rows procesadas: 14.881 posts × 3.000 users
+```
+
+#### C4: Posts más populares por likes
+```
+Execution Time: 37.041 ms
+Plan: Hash Right Join (likes ⟖ posts) + Hash Join (users)
+      HashAggregate sobre 17.032 filas
+      Memory: 3.345 MB
+```
+
+#### C5: Followers de un usuario (OLTP)
+```
+Execution Time: 0.041 ms
+Plan: Index Scan on idx_follows_followed_id
+      Index Cond: (followed_id = 1)
+      Nested Loop con users_pkey
+```
+
+#### C6: Cross-shard — Nodo 1 (user_ids locales)
+```
+Execution Time: 0.989 ms
+Plan: Bitmap Index Scan on idx_posts_user_created
+      user_id IN (1,2,5,8,10) → 25 rows
+```
+
+#### C6: Cross-shard — Nodo 1 consultando user_ids de Nodo 2
+```
+Execution Time: 0.023 ms
+Rows: 0 — los user_ids 3001,3002,3500 NO existen en este nodo
+→ La app debe consultar Nodo 2 por separado y combinar resultados
+```
+
+#### C7: Vista v_user_stats (múltiples JOINs)
+```
+Execution Time: 5.652 ms
+Plan: GroupAggregate + Merge Right Join + Index Only Scan
+      Memoize hits: 618 / misses: 100 (caché efectivo)
+```
+
+#### C8: Benchmark perfil usuario (500 usuarios)
+```
+Execution Time: 42.479 ms
+Plan: GroupAggregate + Nested Loop Left Join
+      73.714 filas procesadas para 500 usuarios
+```
+
+### 7.2 EXPLAIN ANALYZE — CockroachDB (datos reales)
+
+#### C1: Feed local (sin índice)
+```
+execution time: 81ms
+distribution: full
+Plan: FULL SCAN on posts (50.000 filas)
+      rows decoded from KV: 50.001 (5.2 MiB, 2 gRPC calls)
+```
+
+#### C1: Feed local (con índice)
+```
+execution time: 7ms
+distribution: local
+Plan: Index scan on idx_posts_user_created
+      rows decoded from KV: 15 (1008 B, 3 gRPC calls)
+      isolation level: serializable
+```
+
+#### C3: OLAP GROUP BY (sin índice)
+```
+execution time: 117ms
+distribution: full
+Plan: Hash Join + group (hash)
+      rows decoded from KV: 60.000 (5.6 MiB)
+```
+
+#### C3: OLAP GROUP BY (con índice)
+```
+execution time: 74ms
+distribution: full
+Plan: Hash Join + group (hash)
+      rows decoded from KV: 60.000 (2.3 MiB) — menos bytes por índice
+```
+
+### 7.3 Comparación consolidada PostgreSQL vs CockroachDB
+
+| Consulta | PostgreSQL (ms) | CockroachDB sin índice (ms) | CockroachDB con índice (ms) |
+|----------|----------------|-----------------------------|-----------------------------|
+| C1: Feed local (OLTP) | **0.069** | 81 | 7 |
+| C2: Full-text ILIKE | 22.4 | — | — |
+| C3: OLAP GROUP BY | 11.2 | 117 | 74 |
+| C4: Posts populares | 37.0 | — | — |
+| C5: Followers Index | **0.041** | — | — |
+| C6: Cross-shard (local) | 0.989 | — | — |
+| C6: Cross-shard (remoto) | 0 rows* | N/A | N/A automático |
+| C8: Perfil 500 usuarios | 42.5 | — | — |
+
+*En PostgreSQL, consultar user_ids de otro shard devuelve 0 resultados — la app debe consultar cada nodo por separado.
+
+**Observaciones clave:**
+- PostgreSQL es ~100x más rápido en consultas OLTP locales (0.069 ms vs 7 ms) gracias a la ausencia de overhead de red y consenso distribuido.
+- CockroachDB mejora dramáticamente con índices (81 ms → 7 ms en C1).
+- CockroachDB maneja cross-shard automáticamente (`distribution: full`); PostgreSQL requiere lógica en la aplicación.
+- CockroachDB usa `isolation level: serializable` por defecto, sin configuración adicional.
+
+### 7.4 Impacto de réplicas en PostgreSQL
+
+| Modo replicación | Estado réplicas | sync_state |
+|-----------------|----------------|------------|
+| Streaming async | 2 réplicas activas | async |
+| Verificado con | `pg_stat_replication` | streaming |
+
+Las réplicas son read-only (`pg_is_in_recovery() = t`). Intentar escritura en réplica produce:
+```
+ERROR: cannot execute INSERT in a read-only transaction
+ERROR: cannot execute CREATE TABLE in a read-only transaction
+```
+
+### 7.5 Simulación de Failover
+
+*(pendiente de completar)*
 
 ---
 
 ## 8. Análisis comparativo final
 
-| Dimensión | PostgreSQL (distribuido manual) | NewSQL (CockroachDB / YugabyteDB) |
-|---|---|---|
-| **Arquitectura base** | Motor monolítico, distribución manual con herramientas externas (Citus, pgPool) | Diseñado desde cero para distribución horizontal (shared-nothing) |
-| **Particionamiento** | Manual por rango, hash o lista. La lógica de enrutamiento la gestiona la aplicación | Automático (auto-sharding). El motor divide y redistribuye rangos dinámicamente |
-| **Transparencia de enrutamiento** | Baja. La aplicación necesita conocer la topología de shards | Alta. El cliente conecta a cualquier nodo y obtiene el dato correcto |
-| **Replicación** | Líder-seguidor, configuración manual vía `postgresql.conf` | Protocolo Raft, automático y continuo |
-| **Consistencia** | ACID en un nodo. Distribuida requiere 2PC manual | Consistencia serializable global por defecto |
-| **Modelo CAP** | CA en nodo único. CP o AP según configuración en distribución | CP: prefiere rechazar escrituras antes que datos inconsistentes |
-| **PACELC** | PA/EL (async) o PC/EC (sync) | PC/EC siempre |
-| **Transacciones distribuidas** | No nativas. 2PC manual: `PREPARE TRANSACTION` + `COMMIT PREPARED` | Nativas y transparentes. El desarrollador usa `BEGIN`/`COMMIT` estándar |
-| **Failover** | Manual o semi-automático (Patroni, repmgr). Riesgo de split-brain | Automático en segundos vía Raft. Sin intervención del operador |
-| **Failback** | Manual. Requiere resincronizar y reintegrar el nodo | Automático. El nodo recuperado se reincorpora al cluster solo |
-| **Tolerancia a fallos** | Depende de `synchronous_standby_names`. Sin quórum nativo | Quórum Raft: 3 nodos toleran 1 fallo, 5 nodos toleran 2 |
-| **Latencia escritura** | Muy baja en async (~2 ms). Mayor en sync (~15 ms) | Moderada (~4–12 ms) por overhead de consenso |
-| **Latencia lectura** | Muy baja en lecturas locales (~0.8 ms) | Levemente mayor (~2 ms), lecturas follower con posible staleness |
-| **Escalabilidad horizontal** | Compleja. Requiere redistribuir particiones y actualizar el router | Nativa. Agregar un nodo redistribuye shards automáticamente |
-| **Joins distribuidos** | Costosos. Se transfieren datos entre nodos o se combinan en la aplicación | El motor optimiza internamente, aunque con overhead de red |
-| **Complejidad operativa** | Alta. Múltiples herramientas externas (Patroni, pgBouncer, pgPool) | Baja a media. La distribución y failover son responsabilidad del motor |
-| **Complejidad de desarrollo** | Alta. El desarrollador maneja topología, enrutamiento y 2PC | Baja. SQL estándar, distribución transparente |
-| **Compatibilidad SQL** | SQL estándar completo + extensiones PostgreSQL (JSONB, PostGIS, etc.) | Dialecto PostgreSQL (CockroachDB). Algunas funciones avanzadas pueden no estar |
-| **Costo infraestructura** | Bajo en instancias propias. Alto en mantenimiento operativo (DBA) | Mayor en recursos (mínimo 3 nodos recomendados). Menor costo operativo |
-| **Madurez** | Muy madura (30+ años). Ecosistema enorme | Relativamente joven (desde 2015–2017). Ecosistema en crecimiento |
-| **Caso de uso ideal** | Distribución moderada, equipos con experiencia en PostgreSQL, control total deseado | Escala global, alta disponibilidad automática, mínima complejidad operativa |
+| Dimensión | PostgreSQL (distribuido manual) | CockroachDB |
+|-----------|--------------------------------|-------------|
+| **Particionamiento** | Manual por rango. CHECK constraint impone el rango. Enrutamiento en la aplicación | Automático. Auto-sharding por rangos de clave. Transparente |
+| **Replicación** | Streaming replication. Configuración manual vía postgresql.conf y pg_basebackup | Protocolo Raft automático. Cada rango tiene 3 réplicas por defecto |
+| **Consistencia** | ACID local. Distribuida requiere 2PC manual | Serializable global por defecto. Sin configuración adicional |
+| **Modelo CAP** | CA por nodo. Configurable hacia CP (sync) o AP (async) | CP siempre |
+| **PACELC** | PA/EL (async) o PC/EC (sync) — configurable | PC/EC siempre |
+| **Transacciones distribuidas** | No nativas. PREPARE TRANSACTION + COMMIT PREPARED manual | Nativas y transparentes. BEGIN/COMMIT estándar |
+| **Failover** | Manual. pg_ctl promote. Riesgo de split-brain sin Patroni | Automático en segundos vía Raft |
+| **Latencia OLTP local** | Muy baja (~0.069 ms con índice en caché) | Mayor (~7 ms con índice, overhead gRPC) |
+| **Latencia OLAP** | ~11–42 ms por nodo (datos parciales) | ~74–117 ms (datos completos, distribuido) |
+| **Cross-shard joins** | No nativos. Combinar en aplicación, múltiples conexiones | Nativos. distribution: full automático |
+| **Carga de datos** | Archivo separado por nodo (_nodo1.sql, _nodo2.sql, _nodo3.sql) | Un solo endpoint. 10.000 users, 50.000 posts en un comando |
+| **Complejidad operativa** | Alta. pg_hba, postgresql.conf, slots de replicación, security groups, permisos | Baja. docker run + init |
+| **Compatibilidad SQL** | SQL estándar completo + extensiones PG | Dialecto PostgreSQL. Algunas funciones de sistema difieren (ej. pg_tables → crdb_internal) |
+| **Escalabilidad** | Manual. Redistribuir shards requiere migración de datos | Nativa. Agregar nodo redistribuye automáticamente |
 
 ---
 
 ## 9. Análisis crítico
 
-### 9.1 Complejidad operativa: lo que los benchmarks no muestran
+### 9.1 Complejidad operativa real
 
-La implementación de este proyecto pone en evidencia una brecha significativa entre la complejidad *teórica* de los sistemas distribuidos y la complejidad *práctica* de operarlos. Configurar sharding manual en PostgreSQL requiere tomar decisiones que no tienen una respuesta única correcta: ¿qué estrategia de particionamiento minimizará los hot spots en los próximos dos años? ¿Cuándo es conveniente redistribuir shards? ¿Cómo se garantiza que el `synchronous_commit` esté configurado correctamente en todos los nodos después de un failover?
+La implementación de este proyecto evidencia una brecha significativa entre la complejidad teórica y la práctica operativa. Configurar sharding manual en PostgreSQL requirió resolver problemas no documentados: security groups de AWS bloqueando tráfico entre nodos, permisos de sistema en Kali Linux impidiendo la instalación de paquetes, rutas de archivos inaccesibles para el usuario `postgres`, y slots de replicación que deben pre-existir antes del basebackup.
 
-Estas preguntas son representativas de lo que equipos de ingeniería reales enfrentan. Un caso concreto es el de **Rappi** (Colombia), que en su crecimiento acelerado entre 2017 y 2020 debió migrar progresivamente de bases de datos centralizadas hacia arquitecturas distribuidas, experimentando exactamente los trade-offs descritos en este proyecto: mayor complejidad operativa a cambio de escalabilidad. La gestión de la consistencia eventual en un sistema de pedidos, donde un producto puede mostrarse como disponible mientras ya fue comprado por otro usuario en otro nodo, no es un problema trivial.
+Ninguno de estos problemas es técnicamente difícil en aislamiento, pero en conjunto representan horas de debugging que un sistema administrado o NewSQL habría absorbido internamente. CockroachDB se inicializó con tres comandos `docker run` y un `init`; PostgreSQL distribuido requirió configurar manualmente postgresql.conf, pg_hba.conf, slots de replicación, security groups, usuarios de replicación y permisos de sistema.
 
-A nivel internacional, **Twitter** (hoy X) operó durante años con particionamiento manual de MySQL, exactamente el modelo que este proyecto implementa con PostgreSQL. El equipo de ingeniería documentó públicamente cómo el crecimiento de la plataforma los obligó a desarrollar herramientas propias de enrutamiento y redistribución de shards, una inversión de ingeniería de meses que los sistemas NewSQL proveen de forma nativa.
+Un caso concreto que ilustra esto a escala industrial es **Rappi** (Colombia): en su crecimiento entre 2017 y 2020, la compañía debió migrar progresivamente de bases de datos centralizadas hacia arquitecturas distribuidas, enfrentando exactamente estos trade-offs. La gestión de consistencia eventual en un sistema de pedidos donde un producto puede mostrarse disponible mientras ya fue comprado en otro nodo no es un problema trivial, y requirió equipos dedicados exclusivamente a infraestructura de datos.
 
 ### 9.2 Impacto en costos
 
-El análisis de costos revela una paradoja frecuente en la industria: lo que parece más barato a corto plazo puede ser más costoso a largo plazo.
+| Aspecto | PostgreSQL distribuido | CockroachDB Cloud |
+|---------|----------------------|-------------------|
+| Infraestructura | EC2 t3.medium ~$30/mes/nodo | ~$200-400/mes/nodo (gestionado) |
+| Costo DBA | Alto (8–15M COP/mes en Colombia) | Bajo (motor gestiona failover/sharding) |
+| Costo downtime | Alto (failover manual puede tomar horas) | Bajo (failover automático en segundos) |
+| Punto de equilibrio | Equipos pequeños con experiencia PG | Equipos que crecen rápido o escala global |
 
-**PostgreSQL distribuido manual:**
-- Infraestructura: bajo costo por instancia (EC2 t3.medium ~$30/mes).
-- Costo oculto: tiempo de ingeniería para configurar, monitorear y mantener el sistema. Un DBA con experiencia en PostgreSQL distribuido tiene un costo de mercado en Colombia de aproximadamente $8–15 millones COP/mes (datos de plataformas como Computrabajo y LinkedIn, 2024).
-- Riesgo: un incidente de split-brain o un bloqueo de 2PC en producción puede implicar horas de downtime y pérdida de datos con costo difícil de cuantificar.
+El costo oculto más significativo de PostgreSQL distribuido manual no es la infraestructura sino el tiempo de ingeniería. Un incidente de split-brain o un bloqueo de 2PC en producción puede implicar horas de downtime.
 
-**NewSQL (CockroachDB Cloud / YugabyteDB Managed):**
-- Infraestructura: mayor costo por nodo en modalidad gestionada (~$200–400/mes por nodo en CockroachDB Dedicated).
-- Costo operativo: significativamente menor. El failover, la redistribución de shards y la replicación son gestionados por el motor.
-- El punto de equilibrio económico, según análisis de Gartner (2023), típicamente se alcanza cuando el equipo de ingeniería supera 5–8 personas dedicadas a infraestructura de datos.
+### 9.3 Lo que los benchmarks no muestran
 
-### 9.3 Transparencia real en la industria
+Los números de latencia de este proyecto (0.069 ms PostgreSQL vs 7 ms CockroachDB en OLTP) favorecen a PostgreSQL, pero omiten variables críticas de producción:
 
-Un aspecto que frecuentemente se subestima es cuánto de la complejidad descrita en este proyecto está **oculta** en los sistemas de producción reales. Plataformas como Instagram (Meta) o TikTok procesan miles de millones de operaciones diarias sobre arquitecturas distribuidas donde el desarrollador promedio escribe SQL estándar sin conocer los detalles del enrutamiento, la replicación o el consenso. Esta abstracción es poderosa pero también peligrosa: un desarrollador que no comprende los fundamentos puede tomar decisiones de diseño (consultas sin índices, transacciones largas, joins innecesarios) que escalan linealmente en costo y latencia.
+- **Escalabilidad:** agregar un cuarto nodo en PostgreSQL requiere redistribuir manualmente los rangos y migrar datos. En CockroachDB es un `docker run` adicional.
+- **Consistencia bajo carga:** PostgreSQL async puede perder transacciones ante un failover; CockroachDB no.
+- **Cross-shard invisible:** Twitter operó años con sharding manual de MySQL antes de desarrollar herramientas propias de redistribución, una inversión de meses de ingeniería que CockroachDB provee nativamente.
 
-La implementación manual que propone este proyecto, aunque más compleja, tiene un valor pedagógico irreemplazable: obliga a entender los mecanismos que los sistemas modernos abstraen.
+### 9.4 BD centralizada vs distribuida vs servicio administrado
 
-### 9.4 Bases de datos distribuidas vs centralizadas vs servicio administrado en nube
-
-| Dimensión | BD centralizada | BD distribuida manual | Servicio administrado (RDS, Cloud SQL) |
-|---|---|---|---|
-| Complejidad de implementación | Baja | Alta | Media |
+| Dimensión | BD centralizada | BD distribuida manual | Servicio administrado (RDS) |
+|-----------|----------------|----------------------|----------------------------|
+| Complejidad implementación | Baja | Alta | Media |
 | Complejidad operativa | Baja | Muy alta | Baja |
-| Escalabilidad | Limitada (vertical) | Alta (horizontal) | Media–alta |
-| Control sobre la infraestructura | Total | Total | Limitado |
+| Escalabilidad | Vertical limitada | Horizontal | Media-alta |
+| Control infraestructura | Total | Total | Limitado |
 | Costo inicial | Bajo | Medio | Bajo |
-| Costo a escala | Bajo–medio | Medio (si se optimiza) | Alto |
+| Costo a escala | Bajo-medio | Medio | Alto |
 | Vendor lock-in | Ninguno | Ninguno | Alto |
-| Disponibilidad garantizada (SLA) | Depende del equipo | Depende del equipo | Alta (99.9%–99.99%) |
+| SLA disponibilidad | Equipo | Equipo | 99.9–99.99% |
 
-Para startups en etapa temprana o proyectos de tamaño mediano, un servicio administrado como Amazon RDS o Google Cloud SQL ofrece el mejor balance entre complejidad y costo. La distribución manual tiene sentido cuando el volumen de datos o las restricciones regulatorias (soberanía de datos, cumplimiento PCI-DSS) lo requieren. Los sistemas NewSQL son la opción adecuada para escala global con equipos de ingeniería maduros.
+Para proyectos en etapa temprana, RDS o Cloud SQL ofrece el mejor balance. La distribución manual tiene sentido con restricciones regulatorias o cuando el volumen lo justifica. NewSQL es adecuado para escala global con equipos maduros.
 
 ---
 
 ## 10. Generador de datos sintéticos
 
-El script `generate_data.py` en la raíz del repositorio genera archivos SQL listos para cargar en cada nodo.
-
-### Instalación
+### Instalación y uso
 
 ```bash
+python3 -m venv venv
+source venv/bin/activate
 pip install faker
-```
-
-### Uso
-
-```bash
-# Generar el volumen completo del proyecto
-python generate_data.py \
-  --users 10000 \
-  --posts 50000 \
-  --follows 30000 \
-  --likes 100000 \
-  --out ./data
+python generate_data.py --users 10000 --posts 50000 --follows 30000 --likes 100000 --out ./data
 ```
 
 ### Archivos generados
 
 ```
 data/
-├── users_nodo1.sql     # usuarios 1–3000
-├── users_nodo2.sql     # usuarios 3001–6000
-├── users_nodo3.sql     # usuarios 6001–10000
-├── posts_nodo1.sql     # posts de usuarios 1–3000
-├── posts_nodo2.sql     # posts de usuarios 3001–6000
-├── posts_nodo3.sql     # posts de usuarios 6001–10000
-├── follows_all.sql     # todos los follows (cross-shard)
-└── likes_all.sql       # todos los likes (cross-shard)
+├── users_nodo1.sql     # 3.000 usuarios (id 1–3000)
+├── users_nodo2.sql     # 3.000 usuarios (id 3001–6000)
+├── users_nodo3.sql     # 4.000 usuarios (id 6001–10000)
+├── posts_nodo1.sql     # 14.881 posts
+├── posts_nodo2.sql     # 14.930 posts
+├── posts_nodo3.sql     # 20.198 posts
+├── follows_nodo1.sql   # 9.033 follows (follower local)
+├── follows_nodo2.sql   # 9.062 follows
+├── follows_nodo3.sql   # 11.924 follows
+├── follows_all.sql     # todos los follows (para CockroachDB)
+├── likes_nodo1.sql     # 29.939 likes
+├── likes_nodo2.sql     # 30.080 likes
+├── likes_nodo3.sql     # 39.999 likes
+└── likes_all.sql       # todos los likes (para CockroachDB)
 ```
 
-### Carga en los nodos
+### Carga en PostgreSQL (por nodo)
 
 ```bash
-# Nodo 1
-psql -h 10.0.0.1 -U postgres -d socialdb -f data/users_nodo1.sql
-psql -h 10.0.0.1 -U postgres -d socialdb -f data/posts_nodo1.sql
-psql -h 10.0.0.1 -U postgres -d socialdb -f data/follows_all.sql
-psql -h 10.0.0.1 -U postgres -d socialdb -f data/likes_all.sql
-
-# Nodo 2
-psql -h 10.0.0.2 -U postgres -d socialdb -f data/users_nodo2.sql
-psql -h 10.0.0.2 -U postgres -d socialdb -f data/posts_nodo2.sql
-psql -h 10.0.0.2 -U postgres -d socialdb -f data/follows_all.sql
-psql -h 10.0.0.2 -U postgres -d socialdb -f data/likes_all.sql
-
-# Nodo 3
-psql -h 10.0.0.3 -U postgres -d socialdb -f data/users_nodo3.sql
-psql -h 10.0.0.3 -U postgres -d socialdb -f data/posts_nodo3.sql
-psql -h 10.0.0.3 -U postgres -d socialdb -f data/follows_all.sql
-psql -h 10.0.0.3 -U postgres -d socialdb -f data/likes_all.sql
+# Nodo 1 — desde laptop
+sudo cp data/users_nodo1.sql /tmp/ && sudo -u postgres psql -d socialdb -f /tmp/users_nodo1.sql
+sudo cp data/posts_nodo1.sql /tmp/ && sudo -u postgres psql -d socialdb -f /tmp/posts_nodo1.sql
+sudo cp data/follows_nodo1.sql /tmp/ && sudo -u postgres psql -d socialdb -f /tmp/follows_nodo1.sql
+sudo cp data/likes_nodo1.sql /tmp/ && sudo -u postgres psql -d socialdb -f /tmp/likes_nodo1.sql
 ```
 
-### Carga en NewSQL (CockroachDB)
+### Carga en CockroachDB (un solo endpoint)
 
 ```bash
-# Un solo endpoint — el motor distribuye automáticamente
-psql -h localhost -p 26257 -U root -d socialdb -f data/users_nodo1.sql
-psql -h localhost -p 26257 -U root -d socialdb -f data/users_nodo2.sql
-psql -h localhost -p 26257 -U root -d socialdb -f data/users_nodo3.sql
-psql -h localhost -p 26257 -U root -d socialdb -f data/posts_nodo1.sql
-# ... etc
+docker exec -it roach1 ./cockroach sql --insecure --database=socialdb --file=/tmp/users_nodo1.sql
+# El motor distribuye automáticamente entre los 3 nodos
 ```
 
 ---

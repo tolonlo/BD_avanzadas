@@ -71,6 +71,7 @@ DECLARE
     v_total    NUMERIC := 0;
     i          INT;
     v_user_id  INT;
+    v_post_id  INT;
 BEGIN
     -- Configurar synchronous_commit a nivel de sesión
     EXECUTE format('SET synchronous_commit = %I', p_sync_mode);
@@ -81,8 +82,11 @@ BEGIN
 
         v_start := clock_timestamp();
 
-        INSERT INTO posts (user_id, content, created_at)
-        VALUES (v_user_id, 'benchmark_' || i || '_sync_' || p_sync_mode, NOW())
+        -- posts.id es manual (INT PK), por eso generamos un id alto para benchmark
+        v_post_id := 900000000 + i;
+
+        INSERT INTO posts (id, user_id, content, created_at)
+        VALUES (v_post_id, v_user_id, 'benchmark_' || i || '_sync_' || p_sync_mode, NOW())
         ON CONFLICT DO NOTHING;
 
         v_end := clock_timestamp();
