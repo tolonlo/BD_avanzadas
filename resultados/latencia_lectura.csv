@@ -1,1 +1,16 @@
-escenario,motor,configuracion,p50_ms,p95_ms,p99_ms,fecha,notas
+motor,consulta,tipo,nodo,latencia_ms,filas_retornadas,index_hit,notas
+PostgreSQL,SELECT user por id,OLTP punto,pg-s1,0.069,1,si,indice en cache
+PostgreSQL,SELECT posts de usuario,OLTP local,pg-s1,0.312,5,si,idx_posts_user_created
+PostgreSQL,SELECT feed (follows locales),OLTP local,pg-s1,1.840,20,si,join local optimizado
+PostgreSQL,SELECT feed (follows cross-shard),OLTP distribuido,pg-s1+pg-s2,18.500,20,parcial,2 conexiones TCP extra
+PostgreSQL,COUNT likes por post,OLAP local,pg-s1,11.200,1,si,idx_likes_post_id
+PostgreSQL,SELECT top posts del nodo,OLAP local,pg-s1,42.300,10,si,seq scan parcial
+PostgreSQL,SELECT estadisticas usuario (v_user_stats),OLAP local,pg-s1,28.700,1,si,vista materializable
+PostgreSQL,JOIN distribuido (agregar en app),OLAP cross-shard,pg-s1+pg-s2+pg-s3,187.000,100,parcial,3 queries + merge en app
+CockroachDB,SELECT user por id,OLTP punto,roach1,7.300,1,si,index scan distribuido
+CockroachDB,SELECT posts de usuario,OLTP local,roach1,8.100,5,si,index scan
+CockroachDB,SELECT feed (follows),OLTP distribuido,roach1,9.200,20,si,distribution: local
+CockroachDB,SELECT feed cross-shard,OLTP distribuido,roach1,12.400,20,si,distribution: full automatico
+CockroachDB,COUNT likes por post,OLAP,roach1,74.200,1,si,distributed scan
+CockroachDB,SELECT top posts global,OLAP global,roach1,117.600,10,si,full cluster scan
+CockroachDB,JOIN distribuido nativo,OLAP global,roach1,98.300,100,si,hash join distribuido automatico

@@ -512,17 +512,27 @@ Plan: Hash Join + group (hash)
 - CockroachDB maneja cross-shard automáticamente (`distribution: full`); PostgreSQL requiere lógica en la aplicación.
 - CockroachDB usa `isolation level: serializable` por defecto, sin configuración adicional.
 
-### 7.4 Impacto de réplicas en PostgreSQL
+### 7.4 Benchmark synchronous_commit (datos reales)
 
-| Modo replicación | Estado réplicas | sync_state |
-|-----------------|----------------|------------|
-| Streaming async | 2 réplicas activas | async |
-| Verificado con | `pg_stat_replication` | streaming |
+Ejecutado en pg-s2 (nuevo Primary tras failover) con 2 réplicas activas en la misma VPC de AWS:
 
-Las réplicas son read-only (`pg_is_in_recovery() = t`). Intentar escritura en réplica produce:
+| sync_mode | iterations | avg_ms | min_ms | max_ms |
+|-----------|-----------|--------|--------|--------|
+| `off` (async) | 100 | 0.054 ms | 0.022 ms | 1.250 ms |
+| `on` (sync)   | 100 | 0.035 ms | 0.022 ms | 0.192 ms |
+
+**Observación importante:** en este entorno `on` resultó más rápido que `off` porque las réplicas están en la misma VPC de AWS con latencia ~1ms. En producción con réplicas en distintas regiones, `on` sería 5–10x más lento. El valor real del benchmark es el `max_ms`: `off` tuvo picos de 1.250 ms vs `on` de solo 0.192 ms, lo que refleja que sin sincronización hay mayor varianza.
+
+**Estado de replicación (lag_bytes = 0 → réplicas completamente al día):**
+```
+  client_addr  |   state   | send_lag_bytes | write_lag_bytes | flush_lag_bytes
+ 172.31.30.214 | streaming |       0        |        0        |        0
+ 172.31.17.120 | streaming |       0        |        0        |        0
+```
+
+Las réplicas son read-only. Intentar escritura produce:
 ```
 ERROR: cannot execute INSERT in a read-only transaction
-ERROR: cannot execute CREATE TABLE in a read-only transaction
 ```
 
 ### 7.5 Simulación de Failover
@@ -572,6 +582,44 @@ ERROR: cannot execute CREATE TABLE in a read-only transaction
 4. **Sin automatización:** todo el proceso tomó múltiples pasos manuales. En producción, Patroni + etcd automatiza la detección y promoción con quórum, evitando split-brain (dos nodos creyéndose Primary simultáneamente).
 
 **Contraste con CockroachDB:** el mismo escenario en CockroachDB se resuelve con `docker stop roach1` — el cluster elige automáticamente un nuevo leaseholder via Raft en segundos, sin intervención del operador.
+
+### 7.6 Failover CockroachDB (datos reales)
+
+```bash
+docker stop roach1
+docker exec -it roach2 ./cockroach sql --insecure --database=socialdb \
+  --execute="SELECT COUNT(*) FROM users;"
+# → 10000 rows en 79ms — cluster operando sin roach1
+```
+
+Estado del cluster con roach1 caído:
+```
+  id |   address    |  build  | is_available | is_live
+   1 | roach1:26257 | v26.1.2 |    false     |  false   ← caído
+   2 | roach2:26257 | v26.1.2 |    true      |  true
+   3 | roach3:26257 | v26.1.2 |    true      |  true
+-- quórum mantenido con 2/3 nodos
+```
+
+Reincorporación:
+```bash
+docker start roach1
+sleep 5
+docker exec -it roach2 ./cockroach node status --insecure
+# → Los 3 nodos is_live: true en ~5 segundos
+```
+
+**Comparativa failover PostgreSQL vs CockroachDB:**
+
+| Aspecto | PostgreSQL | CockroachDB |
+|---------|-----------|-------------|
+| Detección caída | Manual | Automático (Raft) |
+| Promoción nuevo Primary | `pg_ctl promote` manual | Automático |
+| Redirigir réplicas | `ALTER SYSTEM SET primary_conninfo` | Automático |
+| Crear slots replicación | Manual post-promoción | No aplica |
+| Reincorporar nodo | `pg_basebackup` + restart | `docker start` |
+| Tiempo total | ~15–20 minutos | ~5 segundos |
+| Riesgo split-brain | Sí, sin Patroni | No, Raft garantiza un solo líder |
 
 ---
 

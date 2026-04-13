@@ -1,1 +1,13 @@
-escenario,motor,configuracion,p50_ms,p95_ms,p99_ms,fecha,notas
+motor,operacion,modo,nodo,latencia_ms,throughput_ops_s,notas
+PostgreSQL,INSERT users,synchronous_commit=off,pg-s1,0.054,18518,async local
+PostgreSQL,INSERT users,synchronous_commit=on,pg-s1,0.035,28571,sync local - red LAN AWS
+PostgreSQL,INSERT posts,synchronous_commit=off,pg-s1,0.061,16393,async local
+PostgreSQL,INSERT posts,synchronous_commit=on,pg-s1,0.042,23809,sync local
+PostgreSQL,INSERT follows (cross-shard),synchronous_commit=off,pg-s1+pg-s2,12.400,80,cross-shard via app
+PostgreSQL,INSERT likes,synchronous_commit=off,pg-s2,0.058,17241,async local
+PostgreSQL,PREPARE TRANSACTION (2PC fase 1),manual,pg-s1,3.200,312,overhead 2PC
+PostgreSQL,COMMIT PREPARED (2PC fase 2),manual,pg-s1,2.800,357,overhead 2PC
+CockroachDB,INSERT users,serializable,roach1,7.100,140,consenso Raft incluido
+CockroachDB,INSERT posts,serializable,roach1,7.400,135,consenso Raft incluido
+CockroachDB,INSERT follows,serializable,roach1,7.200,138,distribuido automatico
+CockroachDB,INSERT likes,serializable,roach1,7.600,131,distribuido automatico

@@ -1,109 +1,124 @@
 # Análisis Crítico — SI3009 Proyecto 2
-## Arquitecturas Distribuidas: Reflexiones desde la Implementación
-
-> **Grupo:** [nombre del grupo]  
-> **Curso:** Bases de Datos Avanzadas · 2026-1
+## Arquitecturas Distribuidas: lo que la teoría no cuenta
 
 ---
 
-## 1. La brecha entre teoría y operación real
+## 1. La brecha entre teoría y práctica operativa
 
-Implementar este proyecto reveló una diferencia fundamental que los libros de texto no transmiten bien: la distancia entre *entender* un concepto y *operarlo* bajo presión.
+Los conceptos de sharding, replicación y 2PC se explican en clase con diagramas limpios y flujos de tres pasos. La realidad de implementarlos es otra cosa.
 
-El teorema CAP se explica en un párrafo. Configurar `synchronous_standby_names` correctamente en tres nodos con latencia de red simulada, verificar que ninguno cree erróneamente ser el Primary, y luego medir que el failover efectivamente ocurre en segundos y no en minutos, es un ejercicio completamente distinto. En ese proceso aparecen preguntas que ningún diagrama responde: ¿qué sucede si la réplica se atrasa durante el proceso de promote? ¿El router de la aplicación detecta el cambio de Primary o sigue enviando escrituras al nodo caído?
+Durante este proyecto, antes de escribir una sola línea de SQL distribuido, hubo que resolver: un sistema operativo que bloquea la instalación de paquetes Python (Kali Linux con PEP 668), security groups de AWS que silenciosamente descartaban tráfico entre nodos en la misma VPC, un usuario de sistema (`postgres`) que no puede acceder al directorio home del usuario ubuntu, y slots de replicación que deben crearse manualmente antes del `pg_basebackup` o el proceso falla sin un mensaje de error claro.
 
-Estas preguntas tienen respuesta, pero la respuesta requiere operar el sistema, no solo leerlo. Eso es exactamente lo que este proyecto aporta.
+Ninguno de estos problemas aparece en la documentación oficial de PostgreSQL. Todos requirieron debugging real. En conjunto, representaron más tiempo que la configuración técnica en sí. Esto no es una queja — es el punto central del análisis: **la complejidad operativa de los sistemas distribuidos vive en los detalles que los papers y tutoriales omiten.**
 
----
-
-## 2. El costo oculto de la distribución manual
-
-### 2.1 Lo que los benchmarks no muestran
-
-Las tablas de latencia en el README muestran números limpios. Lo que no muestran es el tiempo que tomó llegar a esos números:
-
-- Detectar que `max_prepared_transactions = 0` (el default) impedía ejecutar 2PC, y que cambiar ese parámetro requería reiniciar el nodo.
-- Entender que las foreign keys entre tablas de nodos distintos no son posibles, y que la integridad referencial cross-shard es responsabilidad de la aplicación.
-- Descubrir que un `PREPARE TRANSACTION` no confirmado bloquea filas indefinidamente y que la consulta para detectarlo (`pg_prepared_xacts`) no es intuitiva.
-
-Cada uno de estos obstáculos, trivial en retrospectiva, representa tiempo de ingeniería en producción. Y en producción, ese tiempo tiene un costo directo.
-
-### 2.2 El caso Rappi (Colombia)
-
-Rappi es un ejemplo particularmente relevante porque ilustra los mismos trade-offs de este proyecto a escala real y en contexto latinoamericano. Entre 2017 y 2020, durante su expansión acelerada a múltiples países, Rappi enfrentó exactamente el problema que describe la Sección 9 del README: la base de datos centralizada que funcionaba bien en Colombia comenzó a mostrar limitaciones cuando el volumen de pedidos simultáneos creció exponencialmente.
-
-La solución no fue inmediata ni elegante. Rappi adoptó una arquitectura de microservicios progresivamente, separando primero el servicio de pedidos del catálogo, luego el de pagos del de notificaciones. Cada separación implicaba decidir dónde vivía la fuente de verdad de cada entidad y cómo se mantenía la consistencia entre servicios. El patrón SAGA, mencionado como bonus en este proyecto, no es un concepto académico para Rappi: es la forma en que un pedido puede fallar en el pago pero no dejar el inventario del restaurante en un estado inconsistente.
-
-Lo que no se documenta públicamente, pero es razonable inferir, es cuántos incidentes de producción ocurrieron en el camino. Esos incidentes son el precio real de la distribución.
-
-### 2.3 El caso Twitter/X
-
-Twitter operó durante años con particionamiento manual de MySQL, el equivalente a lo que este proyecto implementa con PostgreSQL. El equipo de infraestructura documentó públicamente cómo el crecimiento de la plataforma los obligó a construir herramientas propias: **Gizzard** para el enrutamiento de shards, **Finagle** para la comunicación entre servicios, **Manhattan** como base de datos distribuida propia.
-
-La inversión fue de meses de ingeniería de élite. Los sistemas NewSQL como CockroachDB o YugabyteDB proveen esa funcionalidad de forma nativa. La pregunta no es si usar NewSQL es "mejor" en abstracto, sino si la inversión en construir la infraestructura de enrutamiento se justifica cuando existe una alternativa madura.
-
-Para Twitter en 2010, la respuesta era sí: las soluciones NewSQL no existían. Para un equipo de ingeniería en 2026, la respuesta casi siempre es no.
+CockroachDB, en contraste, se inicializó con cuatro comandos. El mismo cluster de tres nodos que tomó horas en PostgreSQL tomó minutos en CockroachDB. Esa diferencia no está en el rendimiento — está en dónde vive la complejidad: en el motor o en el equipo de operaciones.
 
 ---
 
-## 3. Análisis de costos: lo que brilla no siempre es oro
+## 2. Lo que los números no dicen
 
-### 3.1 La paradoja del costo aparente
+Los benchmarks de este proyecto muestran que PostgreSQL es ~100x más rápido que CockroachDB en consultas OLTP locales (0.069 ms vs 7 ms). Ese número es real y correcto en el contexto del experimento. Pero omite variables críticas:
 
-PostgreSQL es gratuito. CockroachDB tiene un tier gratuito. Pero el costo de operar un sistema distribuido no está en las licencias, sino en el tiempo humano requerido para mantenerlo.
+**Datos locales vs datos distribuidos.** PostgreSQL fue ~100x más rápido porque la consulta accedió datos que estaban en el mismo nodo, en caché, sin ningún salto de red. Si el usuario 1500 hubiera estado en otro shard, el tiempo habría incluido una conexión TCP adicional, serialización, y deserialización — fácilmente 10–50ms extra. CockroachDB manejó eso automáticamente con `distribution: full`.
 
-| Componente | PostgreSQL distribuido manual | CockroachDB Dedicated | RDS Multi-AZ |
-|---|---|---|---|
-| Licencia | $0 | ~$200–400/nodo/mes | ~$150–300/instancia/mes |
-| Tiempo DBA (setup) | 40–80 horas | 4–8 horas | 1–2 horas |
-| Tiempo DBA (mantenimiento mensual) | 20–40 horas | 2–5 horas | 0–2 horas |
-| Costo DBA senior en Colombia (mercado 2024–2025) | ~$10–15M COP/mes | — | — |
-| Costo efectivo mensual (infraestructura + DBA) | $500 + labor | $800 + mínima labor | $400 + mínima labor |
+**Consistencia implícita.** CockroachDB corrió cada consulta con `isolation level: serializable` sin configuración adicional. Para obtener el mismo nivel de aislamiento en PostgreSQL distribuido se requiere 2PC manual, que en este proyecto tomó múltiples pasos en dos terminales simultáneas. El "costo" de consistencia en CockroachDB ya está incluido en los 7ms — en PostgreSQL está escondido en la complejidad del código de la aplicación.
 
-El punto de equilibrio se desplaza dependiendo del tamaño del equipo. Para una startup con 2–3 ingenieros de backend que también hacen DBA, el costo oculto de PostgreSQL distribuido manual puede superar fácilmente el de un servicio administrado en los primeros 12 meses de operación.
-
-### 3.2 El costo del incidente
-
-Una consideración que los análisis de costo frecuentemente omiten es el costo de los incidentes. Un bloqueo de 2PC en producción que dura 2 horas tiene un costo difícil de cuantificar: pérdida de transacciones, tiempo de ingenieros en guardia, impacto en la confianza del usuario.
-
-CockroachDB y YugabyteDB no eliminan los incidentes, pero reducen la categoría de incidentes relacionados con consenso y failover. El tradeoff es aceptar mayor latencia base (~4–12 ms vs ~2 ms en PostgreSQL asincrónico) a cambio de no tener que manejar split-brain o transacciones preparadas huérfanas.
+**Escalabilidad futura.** Agregar un cuarto nodo a PostgreSQL requiere decidir qué rango de `user_id` le corresponde, modificar la función de routing, migrar los datos existentes, actualizar `pg_hba.conf` y `shard_metadata`, y redistribuir las réplicas. En CockroachDB es un `docker run` adicional y el motor redistribuye los rangos automáticamente.
 
 ---
 
-## 4. Transparencia real en la industria
+## 3. El failover como experimento de verdad
 
-### 4.1 Lo que el desarrollador promedio no sabe
+El failover fue el experimento más revelador del proyecto. El proceso de promover pg-s2 a Primary tomó aproximadamente 20 minutos e involucró:
 
-En plataformas como Instagram (Meta) o TikTok, el desarrollador promedio escribe SQL estándar o usa un ORM sin saber:
+1. Detectar la caída manualmente (no hay alertas automáticas configuradas)
+2. Ejecutar `pg_ctl promote` en el nodo correcto
+3. Crear los slots de replicación que no se transfirieron
+4. Redirigir pg-s3 que seguía apuntando al Primary caído editando `postgresql.auto.conf`
+5. Hacer `pg_basebackup` para reintegrar pg-s1 como réplica
+6. Actualizar `shard_metadata` para que el router apunte al nuevo Primary
 
-- En qué nodo físico ejecuta su query
-- Si la lectura que acaba de hacer es de un leaseholder o de una réplica con posible staleness
-- Qué protocolo de consenso garantizó que su escritura fue durable
+En ningún momento hubo riesgo de split-brain porque pg-s1 estaba completamente apagado antes de iniciar la promoción. En un escenario real — donde el Primary está en un estado indefinido, respondiendo a algunas conexiones pero no a otras — la decisión de cuándo promover y cómo evitar que el Primary original vuelva a aceptar escrituras simultáneamente es exactamente el problema que Patroni + etcd resuelven con quórum distribuido.
 
-Esta abstracción es poderosa y productiva. Permite que cientos de ingenieros escriban código de producto sin necesitar expertise en sistemas distribuidos.
+CockroachDB resolvió el mismo escenario con `docker stop roach1`. El cluster detectó la caída, eligió un nuevo leaseholder, y siguió operando. `docker start roach1` reincorporó el nodo automáticamente en ~5 segundos. No hubo intervención, no hubo riesgo de split-brain, no hubo comandos adicionales.
 
-Pero tiene un lado oscuro: un desarrollador que no comprende estos fundamentos puede introducir un `SELECT *` sin `LIMIT` sobre una tabla particionada, una transacción que mantiene un lock abierto durante una llamada HTTP, o un join que cruza shards en cada request del feed. En un sistema de baja escala, esos errores son invisibles. En producción con millones de usuarios, se convierten en incidentes.
-
-### 4.2 El valor pedagógico de la dificultad
-
-La implementación manual que propone este proyecto tiene un valor que ningún tutorial de CockroachDB puede replicar: obliga a *sentir* la complejidad.
-
-Cuando se escribe el código de enrutamiento `get_shard_for_user()` manualmente, se entiende visceralmente por qué el auto-sharding de un sistema NewSQL es una abstracción valiosa. Cuando se ejecuta `PREPARE TRANSACTION` y `COMMIT PREPARED` en dos terminales distintas coordinados a mano, se comprende por qué el 2PC nativo de CockroachDB justifica su overhead de latencia. Cuando se simula la caída del Primary y se ejecuta `pg_ctl promote` manualmente, se aprecia el valor del failover automático de Raft.
-
-Sin haber operado el sistema difícil, es imposible valorar correctamente el sistema fácil.
+**La pregunta correcta no es cuál motor es más rápido. Es: ¿cuánto cuesta una hora de downtime en tu sistema, y cuánto cuesta el equipo que previene ese downtime?**
 
 ---
 
-## 5. Conclusión: el mapa y el territorio
+## 4. Casos reales que validan la experiencia
 
-Los modelos CAP y PACELC son mapas. Como todo mapa, simplifican la realidad para hacerla navegable. En el territorio real, las decisiones no son binarias entre CP y AP: son graduales, dependientes del contexto, y cambian con el tiempo a medida que el sistema crece.
+### Rappi (Colombia)
+Entre 2017 y 2020, Rappi pasó de una base de datos centralizada a una arquitectura distribuida a medida que su base de usuarios creció exponencialmente. El problema más difícil no fue técnico — fue operativo: ¿cómo se garantiza que un pedido no se marca como disponible en Bogotá mientras ya fue tomado por un repartidor en Medellín? Exactamente el problema de consistencia eventual que este proyecto experimentó con el sharding manual de `follows` y `likes` entre nodos.
 
-La pregunta correcta no es "¿PostgreSQL o CockroachDB?" sino "¿cuánta complejidad operativa puede absorber nuestro equipo, y cuánta de esa complejidad es necesaria para el problema que estamos resolviendo?".
+La solución de Rappi requirió equipos dedicados a infraestructura de datos que desarrollaron lógica de compensación y reconciliación — el equivalente empresarial del 2PC manual que este proyecto implementó con `PREPARE TRANSACTION`.
 
-Para una red social en sus primeros 6 meses con 10.000 usuarios, la respuesta es probablemente: RDS Multi-AZ, SQL estándar, y no pensar en sharding todavía. Para esa misma red social con 10 millones de usuarios y operación en 5 países, la respuesta cambia. Lo importante es saber reconocer cuándo cambia, y tener el conocimiento para tomar esa decisión con criterio.
+### Twitter / X
+Twitter operó durante años con sharding manual de MySQL, el modelo exacto que este proyecto implementa con PostgreSQL. El equipo de ingeniería documentó públicamente cómo el crecimiento obligó a desarrollar herramientas propias de redistribución de shards — una inversión de meses de ingeniería que sistemas como CockroachDB proveen nativamente. La lección que Twitter aprendió: el costo del sharding manual no está en el hardware sino en el talento de ingeniería dedicado a mantenerlo.
 
-Ese es, en última instancia, el objetivo de este proyecto.
+### Stack Overflow
+Significativamente, Stack Overflow sigue operando con SQL Server centralizado sirviendo millones de requests diarios. Su argumento: la complejidad operativa de una base distribuida no se justifica cuando la optimización cuidadosa de índices y queries en un sistema centralizado puede escalar mucho más de lo que la mayoría asume. Este proyecto lo confirma: PostgreSQL en un solo nodo con los índices del Script 02 respondió en 0.069 ms — más rápido que cualquier sistema distribuido puede aspirar a ser.
 
 ---
 
-*Análisis elaborado para SI3009 Bases de Datos Avanzadas · Universidad · 2026-1*
+## 5. PACELC aplicado a lo experimentado
+
+El modelo PACELC es más útil que CAP para describir lo que este proyecto midió:
+
+**PostgreSQL con `synchronous_commit=off`:**
+- En partición (P): elige disponibilidad (A) — el Primary acepta escrituras aunque las réplicas no confirmen.
+- En operación normal (E): elige latencia (L) — 0.054ms promedio, pero con riesgo de pérdida de datos.
+
+**PostgreSQL con `synchronous_commit=on`:**
+- En partición (P): elige consistencia (C) — el Primary puede bloquearse esperando réplicas.
+- En operación normal (E): elige consistencia (C) — 0.035ms promedio con garantía de durabilidad.
+
+**CockroachDB:**
+- En partición (P): siempre elige consistencia (C) — rechaza escrituras si no hay quórum.
+- En operación normal (E): elige consistencia (C) con overhead de ~7ms por consenso Raft.
+
+La paradoja que este benchmark reveló: en red local (misma VPC AWS), `synchronous_commit=on` fue más rápido que `off` (0.035ms vs 0.054ms). Esto ocurre porque el overhead de sincronización es menor que la varianza del sistema async. La diferencia entre modos se vuelve significativa solo con latencia de red alta — exactamente cuando la consistencia más importa.
+
+---
+
+## 6. Administración: centralizada vs distribuida vs managed
+
+La experiencia de este proyecto permite comparar los tres modelos con datos concretos, no solo teoría:
+
+**Base de datos centralizada** (un solo nodo PostgreSQL):
+- Setup: minutos.
+- Operación: un DBA puede manejarlo solo.
+- Límite: escala vertical. Cuando el servidor llega al tope, no hay salida fácil.
+- Adecuado para: la mayoría de proyectos universitarios, startups tempranas, sistemas internos.
+
+**Base de datos distribuida manual** (este proyecto):
+- Setup: horas a días, con problemas inesperados en cada paso.
+- Operación: requiere conocimiento profundo de PostgreSQL, AWS, networking, y herramientas como Patroni.
+- Límite: la complejidad escala con cada nodo agregado.
+- Adecuado para: equipos con DBA dedicado, requisitos regulatorios de soberanía de datos, o cuando el control total es no negociable.
+
+**Servicio administrado** (RDS, Cloud SQL, CockroachDB Cloud):
+- Setup: minutos, similar al centralizado.
+- Operación: el proveedor gestiona failover, backups, parches, y escalamiento.
+- Límite: vendor lock-in, costo a escala, menos control sobre configuración.
+- Adecuado para: equipos que quieren escalar sin invertir en infraestructura.
+
+**NewSQL self-hosted** (CockroachDB Docker, este proyecto):
+- Setup: ~10 minutos vs ~3 horas de PostgreSQL distribuido.
+- Operación: significativamente más simple que PostgreSQL manual, más complejo que managed.
+- Límite: mínimo 3 nodos para quórum, recursos mínimos más altos.
+- Adecuado para: equipos que necesitan distribución nativa sin depender de un proveedor cloud.
+
+---
+
+## 7. Reflexión final
+
+Este proyecto confirmó algo que los papers de bases de datos distribuidas raramente dicen explícitamente: **la distribución es un costo, no una característica**. Se distribuye cuando el beneficio (escala, disponibilidad, localidad geográfica) supera el costo (complejidad, latencia adicional, riesgo operativo).
+
+PostgreSQL en un solo nodo respondió en 0.069ms. CockroachDB distribuido respondió en 7ms. La diferencia no es un defecto de CockroachDB — es el precio exacto de la distribución automática, el failover en 5 segundos, y la consistencia serializable global. Ese precio puede valer completamente dependiendo del contexto.
+
+Lo que este proyecto enseñó que ningún benchmark enseña: la diferencia entre un sistema que funciona en un tutorial y uno que funciona en producción son exactamente los problemas que no están en el tutorial.
+
+---
+
+*Documento complementario al README.md — SI3009 Bases de Datos Avanzadas · 2026-1*
