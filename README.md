@@ -527,7 +527,51 @@ ERROR: cannot execute CREATE TABLE in a read-only transaction
 
 ### 7.5 Simulación de Failover
 
-*(pendiente de completar)*
+**Escenario:** caída del Primary (pg-s1). Promoción manual de pg-s2. Reintegración de pg-s1 como réplica.
+
+**Estado inicial verificado:**
+```
+-- pg-s1 (Primary)
+  client_addr  |   state   | sync_state
+ 172.31.31.27  | streaming | async
+ 172.31.17.120 | streaming | async
+
+-- pg-s2 y pg-s3
+ pg_is_in_recovery → t
+```
+
+**Proceso ejecutado:**
+
+| Paso | Acción | Comando | Resultado |
+|------|--------|---------|-----------|
+| 1 | Apagar Primary | `systemctl stop postgresql` | `pg_isready` → no response |
+| 2 | Detectar caída en réplica | `pg_last_xact_replay_timestamp()` | lag ~47 min sin WAL nuevo |
+| 3 | Promover pg-s2 | `pg_ctl promote -D /var/lib/postgresql/15/main` | `server promoted` |
+| 4 | Verificar nuevo Primary | `SELECT pg_is_in_recovery()` | `f` (ya no es réplica) |
+| 5 | Probar escritura | `INSERT INTO distributed_ops_log ...` | `INSERT 0 1` ✅ |
+| 6 | Actualizar routing | `UPDATE shard_metadata SET host='172.31.31.27'` | `UPDATE 1` |
+| 7 | Reintegrar pg-s1 | `pg_basebackup -h 172.31.31.27 ...` | `48261/48261 kB (100%)` |
+| 8 | Redirigir pg-s3 | `ALTER SYSTEM SET primary_conninfo` | streaming desde nuevo Primary |
+
+**Estado final:**
+```
+-- pg-s2 (nuevo Primary)
+  client_addr  |   state   | sync_state
+ 172.31.30.214 | streaming | async   ← pg-s1 ahora es réplica
+ 172.31.17.120 | streaming | async   ← pg-s3 redirigido
+```
+
+**Retos encontrados durante el failover:**
+
+1. **Slots de replicación no se transfieren:** al promover pg-s2, los slots `replica_s2` y `replica_s3` no existían en el nuevo Primary. Hubo que crearlos manualmente con `pg_create_physical_replication_slot()` antes de que las réplicas pudieran reconectarse.
+
+2. **pg-s3 seguía apuntando al Primary caído:** el archivo `postgresql.auto.conf` tenía hardcodeada la IP de pg-s1 (`172.31.30.214`). Requirió `ALTER SYSTEM SET primary_conninfo` para redirigirlo manualmente a pg-s2.
+
+3. **Tiempo de detección:** las réplicas no detectan la caída instantáneamente — el lag acumulado llegó a ~47 minutos desde la última transacción replicada, lo que implica potencial pérdida de datos en modo async.
+
+4. **Sin automatización:** todo el proceso tomó múltiples pasos manuales. En producción, Patroni + etcd automatiza la detección y promoción con quórum, evitando split-brain (dos nodos creyéndose Primary simultáneamente).
+
+**Contraste con CockroachDB:** el mismo escenario en CockroachDB se resuelve con `docker stop roach1` — el cluster elige automáticamente un nuevo leaseholder via Raft en segundos, sin intervención del operador.
 
 ---
 
@@ -549,6 +593,25 @@ ERROR: cannot execute CREATE TABLE in a read-only transaction
 | **Complejidad operativa** | Alta. pg_hba, postgresql.conf, slots de replicación, security groups, permisos | Baja. docker run + init |
 | **Compatibilidad SQL** | SQL estándar completo + extensiones PG | Dialecto PostgreSQL. Algunas funciones de sistema difieren (ej. pg_tables → crdb_internal) |
 | **Escalabilidad** | Manual. Redistribuir shards requiere migración de datos | Nativa. Agregar nodo redistribuye automáticamente |
+
+---
+
+## 8.5 Retos reales encontrados en la implementación
+
+Esta sección documenta los problemas concretos que surgieron durante el despliegue, no como errores a esconder sino como evidencia de la complejidad operativa real.
+
+| Reto | Causa | Solución |
+|------|-------|----------|
+| Kali Linux bloqueaba `pip install` | Sistema externamente administrado (PEP 668) | Crear virtualenv con `--system-site-packages` tras instalar `python3.13-venv` |
+| `sudo -u postgres psql` devuelve "Permission denied" | El directorio `/home/ubuntu` no es accesible por el usuario postgres | Inofensivo — el comando funciona igual; solo es un warning del cwd |
+| `pg_basebackup` fallaba con "directory not empty" | El directorio de datos tenía archivos residuales | Usar `find -mindepth 1 -delete` como usuario postgres en lugar de `rm -rf` |
+| Security group bloqueaba tráfico entre nodos | Una instancia tenía un SG diferente (`launch-wizard`) | Agregar `pg-cluster-sg` a la instancia con SG incorrecto |
+| `ping` entre nodos fallaba 100% packet loss | ICMP bloqueado por AWS — el puerto 5432 sí funcionaba | Usar `nc -zv` para verificar conectividad TCP |
+| IP pública cambia al reiniciar instancias | AWS Academy no asigna IPs elásticas por defecto | Actualizar regla SSH en security group con "My IP" cada sesión |
+| Slots de replicación no se transfieren en failover | Los slots son locales al Primary — no se replican | Crear slots manualmente en el nuevo Primary post-promoción |
+| pg-s3 seguía apuntando al Primary caído | `postgresql.auto.conf` tiene IP hardcodeada del basebackup original | `ALTER SYSTEM SET primary_conninfo` para redirigir al nuevo Primary |
+| 2PC no funciona entre nodos diferentes | Las réplicas son read-only | Demostrar 2PC entre dos databases en el mismo Primary |
+| CockroachDB init fallaba con "connection refused" | Contenedores usaban IPv6 que WSL no enruta | Agregar `--listen-addr=0.0.0.0` para forzar IPv4 |
 
 ---
 
